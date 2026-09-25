@@ -619,15 +619,30 @@ namespace
     }
 } // namespace
 
+int tuning_cache_find_valid_entry(rocblaslt_handle                    handle,
+                                  const TensileLite::ProblemOverride& key,
+                                  const RocblasltContractionProblem&  problem,
+                                  std::shared_ptr<void>               gemmData,
+                                  size_t                              max_workspace_bytes)
+{
+    const auto            candidates = ReplayCandidatesByKey::instance().find(handle, key);
+    rocblaslt_matmul_algo algo;
+    return first_supported_candidate(
+        handle, *candidates, problem, gemmData, max_workspace_bytes, &algo);
+}
+
 int tuning_cache_replay(rocblaslt_handle                    handle,
                         const TensileLite::ProblemOverride& key,
                         const RocblasltContractionProblem&  problem,
                         std::shared_ptr<void>               gemmData,
-                        rocblaslt_matmul_algo*              algo)
+                        rocblaslt_matmul_algo*              algo,
+                        bool                                countMiss)
 {
     const auto candidates = ReplayCandidatesByKey::instance().find(handle, key);
     const int  index      = first_supported_candidate(
         handle, *candidates, problem, gemmData, problem.workspaceSize, algo);
+    if(index < 0 && !countMiss)
+        return index;
 
     auto& counters = TensileLite::TuningCounters::instance();
     if(index >= 0)
@@ -3208,8 +3223,20 @@ extern "C" HIPBLASLT_EXPORT void hipblaslt_tuning_reset_for_test()
     counters.hits          = 0;
     counters.misses        = 0;
     counters.invalidated   = 0;
+    counters.tuned         = 0;
+    counters.skipped       = 0;
+    counters.attempts      = 0;
 
+    tuningInjectFailureForTest(0);
     static_cast<void>(tuningLastLaunchedIndexForTest());
+}
+
+// Make later tuning attempts fail at a chosen stage, so a test can prove each
+// failure is handled and latched. See tuningInjectFailureForTest for the
+// stages; reset_for_test clears it.
+extern "C" HIPBLASLT_EXPORT void hipblaslt_tuning_inject_failure_for_test(int stage)
+{
+    tuningInjectFailureForTest(stage);
 }
 
 // The solution the calling thread's last hipblasLtMatmul launched, or -1,
@@ -3227,6 +3254,13 @@ extern "C" HIPBLASLT_EXPORT int hipblaslt_tuning_last_launch_for_test()
 //   4 shapes, 5 matched, 6 fell back
 //       The distinct-shape tally behind the summary line, which is written
 //       during static destruction, after any capture a test could install.
+//   7 tuned, 8 skipped
+//       Tune-mode counters: winners that reached the file, and declines.
+//   9 attempts
+//       Searches that reached tuning-start, successful or not. The lifecycle
+//       lines are bounded per shape, so they cannot show a retry.
+//   10 tuned shapes
+//       Distinct shapes this process tuned, as the summary line counts them.
 //
 // Fills up to count values in that order and returns how many there are, so a
 // test expecting a different list notices instead of misreading it. New values
@@ -3234,8 +3268,8 @@ extern "C" HIPBLASLT_EXPORT int hipblaslt_tuning_last_launch_for_test()
 extern "C" HIPBLASLT_EXPORT size_t hipblaslt_tuning_stats_for_test(uint64_t* values, size_t count)
 {
     const auto& c      = TensileLite::TuningCounters::instance();
-    uint64_t    shapes = 0, matched = 0, fellback = 0;
-    TensileLite::tuningLookupTallyForTest(&shapes, &matched, &fellback);
+    uint64_t    shapes = 0, matched = 0, fellback = 0, tunedShapes = 0;
+    TensileLite::tuningLookupTallyForTest(&shapes, &matched, &fellback, &tunedShapes);
 
     const uint64_t all[] = {c.entriesLoaded.load(),
                             c.hits.load(),
@@ -3243,7 +3277,11 @@ extern "C" HIPBLASLT_EXPORT size_t hipblaslt_tuning_stats_for_test(uint64_t* val
                             c.invalidated.load(),
                             shapes,
                             matched,
-                            fellback};
+                            fellback,
+                            c.tuned.load(),
+                            c.skipped.load(),
+                            c.attempts.load(),
+                            tunedShapes};
 
     constexpr size_t known = sizeof(all) / sizeof(all[0]);
     for(size_t i = 0; values && i < count && i < known; i++)
