@@ -3891,10 +3891,14 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
     catch(const std::exception& e)
     {
         log_error(__func__, e.what());
+        // status may already hold getBestSolutions' success for a call that
+        // passed no algo.
+        status = rocblaslt_status_internal_error;
     }
     catch(...)
     {
         log_error(__func__, "unknown exception");
+        status = rocblaslt_status_internal_error;
     }
 
     return status;

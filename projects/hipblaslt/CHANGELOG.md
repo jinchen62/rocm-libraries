@@ -88,6 +88,7 @@ Full documentation for hipBLASLt is available at [rocm.docs.amd.com/projects/hip
 * A tuning file row cut short, for example when the disk fills while `hipblaslt-bench` appends it, could be replayed with a truncated `solution_index`. A row whose cells do not line up with its header is now ignored.
 * `GemmInstance::getSolutionName()` in `hipblaslt_ext` crashed for a RocRoller solution. It looked the encoded RocRoller index up in the Tensile library and dereferenced the null result. It now returns the RocRoller short name, as `hipblaslt_ext::getSolutionNameFromAlgo()` already did.
 * The logger's destructor called `close()` on the log file, which throws out of a destructor and terminates the process at exit when the log file has failed, for example on a full disk. Reproducible with `HIPBLASLT_LOG_LEVEL=4` and a failing `HIPBLASLT_LOG_FILE`.
+* `hipblasLtMatmul` with no `algo` could return success for a GEMM that never launched. Its status already held the result of choosing the algorithm, and an exception thrown after that returned it unchanged instead of an error.
 
 ## hipBLASLt 1.4.1 for ROCm 7.14
 
