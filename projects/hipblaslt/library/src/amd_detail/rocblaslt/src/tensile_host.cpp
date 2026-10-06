@@ -3793,7 +3793,7 @@ namespace
 
         bool launch(hipStream_t stream)
         {
-            const Device* device = current();
+            const Device* device = current(stream, false);
             if(device == nullptr)
                 return false;
 
@@ -3804,7 +3804,7 @@ namespace
         /** Microseconds one flush launch costs on the current device, or 0. */
         double costUs(hipStream_t stream)
         {
-            const Device* device = current(stream);
+            const Device* device = current(stream, true);
             return device ? device->costUs : 0.0;
         }
 
@@ -3821,7 +3821,7 @@ namespace
         // spend far longer than the calibration itself.
         static constexpr int kCalibrationIters = 2000;
 
-        const Device* current(hipStream_t stream = nullptr)
+        const Device* current(hipStream_t stream, bool calibrateCost)
         {
             int id = 0;
             if(hipGetDevice(&id) != hipSuccess)
@@ -3830,11 +3830,9 @@ namespace
             auto found = m_devices.find(id);
             if(found != m_devices.end())
             {
-                // A launch-only caller can have created this entry before
-                // anyone had a stream to calibrate on, which would otherwise
-                // leave the cost pinned at zero for the life of the process and
-                // silently stop the flush being subtracted.
-                if(found->second.costUs == 0.0 && stream != nullptr)
+                // nullptr is the valid default stream, so the caller's request
+                // to calibrate must be independent of the stream handle.
+                if(found->second.costUs == 0.0 && calibrateCost)
                     found->second.costUs = calibrate(found->second.grid, stream);
                 return &found->second;
             }
@@ -3846,10 +3844,8 @@ namespace
             Device device;
             device.grid = static_cast<unsigned>(props.multiProcessorCount) * 60u;
 
-            // Only the geometry is needed to launch, so publish it first and
-            // let a caller that has no stream to calibrate on use it at zero
-            // cost rather than blocking.
-            if(stream != nullptr)
+            // A launch needs only the geometry; costUs also requests calibration.
+            if(calibrateCost)
                 device.costUs = calibrate(device.grid, stream);
 
             return &(m_devices[id] = device);
