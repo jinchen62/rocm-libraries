@@ -53,9 +53,13 @@
 
 #include <Tensile/Debug.hpp>
 
+#include <atomic>
 #include <hip/hip_runtime_api.h>
 #include <map>
+#include <memory>
+#include <shared_mutex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #define TO_STR2(x) #x
@@ -499,55 +503,147 @@ bool problem_override_from_file_cpp(
     return success;
 }
 
-int tuning_cache_find_valid_entry(rocblaslt_handle                    handle,
-                                  const TensileLite::ProblemOverride& key,
-                                  const RocblasltContractionProblem&  problem,
-                                  std::shared_ptr<void>               gemmData,
-                                  size_t                              max_workspace_bytes)
+namespace
 {
-    std::vector<rocblaslt_matmul_heuristic_result> resolved;
-    std::vector<int>                               index(1);
-
-    for(const auto& entry : tuned_entries_for(key))
+    /**
+     * A key's entries that still name the kernel their index resolves to, in
+     * the order lookups try them. Neither resolving an index nor comparing
+     * names depends on the call, so replay does both once per key, again only
+     * after the loaded entries change. Support is still checked on every call:
+     * it also depends on values the key leaves out, such as beta and C/D
+     * aliasing.
+     */
+    struct ReplayCandidates
     {
-        index[0] = entry.solutionIndex;
+        uint64_t         generation = 0;
+        std::vector<int> indexes;
 
-        // getSolutionsFromIndex appends, and everything below reads [0].
-        resolved.clear();
+        // What the lookup tally has been told about this key: 0 nothing, 1
+        // that it fell back, 2 that it matched. Replay asks on every call; the
+        // tally only needs to hear when the answer improves.
+        std::atomic<int> tallied{0};
+    };
 
-        if(rocblaslt_status_success
-               != getSolutionsFromIndex(handle, index, resolved, max_workspace_bytes)
-           || resolved.empty())
-            continue;
-        if(!tuned_entry_identity_matches(handle, key, entry, resolved[0]))
-            continue;
-
-        // The key leaves out values such as beta and C/D aliasing, so an entry
-        // whose identity holds can still fail this call's support predicates.
-        RocblasltContractionProblem supportProblem = problem;
-        size_t                      required       = 0;
-        auto                        algo           = resolved[0].algo;
-        if(rocblaslt_status_success
-               == isSolutionSupportedNoMutation(handle, supportProblem, gemmData, &algo, &required)
-           && required <= max_workspace_bytes)
-            return entry.solutionIndex;
-
-        // The heuristic replay's XF32 fallback, as a pure probe: the call may go
-        // on to launch some other algorithm, which must not find gemmData left
-        // in FP32 mode.
-        if(problem.compute_type == rocblaslt_compute_f32_fast_xf32)
+    class ReplayCandidatesByKey
+    {
+    public:
+        static ReplayCandidatesByKey& instance()
         {
-            supportProblem.compute_type = rocblaslt_compute_f32;
-            required                    = 0;
-            if(rocblaslt_status_success
-                   == isSolutionSupportedNoMutation(
-                       handle, supportProblem, gemmData, &algo, &required)
-               && required <= max_workspace_bytes)
-                return entry.solutionIndex;
+            static ReplayCandidatesByKey gInstance;
+            return gInstance;
         }
-    }
 
-    return -1;
+        std::shared_ptr<ReplayCandidates> find(rocblaslt_handle                    handle,
+                                               const TensileLite::ProblemOverride& key)
+        {
+            // Read before the entries, so entries added meanwhile leave this
+            // result stale rather than missing them.
+            const uint64_t generation = TensileLite::OverrideMap::getMap().generation();
+            {
+                std::shared_lock<std::shared_mutex> lock(m_mutex);
+                auto                                found = m_byKey.find(key);
+                if(found != m_byKey.end() && found->second->generation == generation)
+                    return found->second;
+            }
+
+            auto fresh        = std::make_shared<ReplayCandidates>();
+            fresh->generation = generation;
+
+            std::vector<rocblaslt_matmul_heuristic_result> resolved;
+            std::vector<int>                               index(1);
+            for(const auto& entry : tuned_entries_for(key))
+            {
+                index[0] = entry.solutionIndex;
+
+                // getSolutionsFromIndex appends, and the check below reads [0].
+                resolved.clear();
+                if(rocblaslt_status_success == getSolutionsFromIndex(handle, index, resolved, 0)
+                   && !resolved.empty()
+                   && tuned_entry_identity_matches(handle, key, entry, resolved[0]))
+                    fresh->indexes.push_back(entry.solutionIndex);
+            }
+
+            std::unique_lock<std::shared_mutex> lock(m_mutex);
+            m_byKey[key] = fresh;
+            return fresh;
+        }
+
+        void clear()
+        {
+            std::unique_lock<std::shared_mutex> lock(m_mutex);
+            m_byKey.clear();
+        }
+
+    private:
+        std::shared_mutex                                                                   m_mutex;
+        std::unordered_map<TensileLite::ProblemOverride, std::shared_ptr<ReplayCandidates>> m_byKey;
+    };
+
+    /** The first candidate that supports this call, with the algo to launch it, or -1. */
+    int first_supported_candidate(rocblaslt_handle                   handle,
+                                  const ReplayCandidates&            candidates,
+                                  const RocblasltContractionProblem& problem,
+                                  std::shared_ptr<void>              gemmData,
+                                  size_t                             max_workspace_bytes,
+                                  rocblaslt_matmul_algo*             algo)
+    {
+        for(const int index : candidates.indexes)
+        {
+            // What getSolutionsFromIndex returns for this index.
+            *algo                               = rocblaslt_matmul_algo{};
+            *reinterpret_cast<int*>(algo->data) = index;
+            algo->max_workspace_bytes           = max_workspace_bytes;
+
+            size_t required = 0;
+            if(rocblaslt_status_success
+                   == isSolutionSupportedInPlace(handle, problem, gemmData, algo, &required)
+               && required <= max_workspace_bytes)
+                return index;
+
+            // The heuristic replay's XF32 fallback, as a pure probe: the call
+            // may go on to launch some other algorithm, which must not find
+            // gemmData left in FP32 mode.
+            if(problem.compute_type == rocblaslt_compute_f32_fast_xf32)
+            {
+                RocblasltContractionProblem supportProblem = problem;
+                supportProblem.compute_type                = rocblaslt_compute_f32;
+                required                                   = 0;
+                if(rocblaslt_status_success
+                       == isSolutionSupportedNoMutation(
+                           handle, supportProblem, gemmData, algo, &required)
+                   && required <= max_workspace_bytes)
+                    return index;
+            }
+        }
+        return -1;
+    }
+} // namespace
+
+int tuning_cache_replay(rocblaslt_handle                    handle,
+                        const TensileLite::ProblemOverride& key,
+                        const RocblasltContractionProblem&  problem,
+                        std::shared_ptr<void>               gemmData,
+                        rocblaslt_matmul_algo*              algo)
+{
+    const auto candidates = ReplayCandidatesByKey::instance().find(handle, key);
+    const int  index      = first_supported_candidate(
+        handle, *candidates, problem, gemmData, problem.workspaceSize, algo);
+
+    auto& counters = TensileLite::TuningCounters::instance();
+    if(index >= 0)
+        counters.hits++;
+    else
+        counters.misses++;
+
+    const int tally = index >= 0 ? 2 : 1;
+    int       told  = candidates->tallied.load(std::memory_order_relaxed);
+    while(told < tally && !candidates->tallied.compare_exchange_weak(told, tally))
+    {
+    }
+    if(told < tally)
+        TensileLite::recordTuningLookup(key, index >= 0);
+
+    return index;
 }
 
 /******************************************************************************
@@ -3104,6 +3200,8 @@ extern "C" HIPBLASLT_EXPORT void hipblaslt_tuning_reset_for_test()
     TensileLite::OverrideMap::getMap().resetForTest();
     OverrideSingleton::getInstance().reloadForTest();
     TensileLite::resetTuningDiagnosticsForTest();
+    TensileLite::resetReplayLoadForTest();
+    ReplayCandidatesByKey::instance().clear();
 
     auto& counters         = TensileLite::TuningCounters::instance();
     counters.entriesLoaded = 0;

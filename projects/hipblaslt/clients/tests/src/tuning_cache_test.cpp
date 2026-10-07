@@ -18,6 +18,7 @@
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include <sstream>
 #include <streambuf>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -177,6 +179,24 @@ namespace
 
         hipblasLtDestroy(handle);
         return found;
+    }
+
+    /** The kernel an index resolves to in this build, or empty. */
+    std::string kernelNameOf(int index)
+    {
+        std::string       name;
+        hipblasLtHandle_t handle = nullptr;
+        if(hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS)
+            return name;
+
+        std::vector<int>                              indexes{index};
+        std::vector<hipblasLtMatmulHeuristicResult_t> results;
+        if(hipblaslt_ext::getAlgosFromIndex(handle, indexes, results) == HIPBLAS_STATUS_SUCCESS
+           && !results.empty())
+            name = hipblaslt_ext::getKernelNameFromAlgo(handle, results[0].algo);
+
+        hipblasLtDestroy(handle);
+        return name;
     }
 
     /** The build this library reports, as hipblaslt-bench records it. */
@@ -1143,6 +1163,83 @@ namespace
         const auto c = counters();
         EXPECT_EQ(c.hits, 0u);
         EXPECT_EQ(c.misses, 1u);
+    }
+
+    // An entry whose name holds but whose solution cannot run the call falls
+    // back, and the support check leaves nothing behind for the launch that
+    // default selection then makes.
+    TEST_F(TuningCache_pre_checkin, NullAlgoFallsBackFromAnEntryThatCannotRunTheCall)
+    {
+        if(!haveSolutions(1))
+            GTEST_SKIP() << "the heuristic offers no solution for this problem";
+
+        // An fp32 solution recorded for the fp16 problem: its index still
+        // names its kernel, but it cannot run fp16 data.
+        int fp32 = -1;
+        ASSERT_TRUE(extHeuristicIndex(&fp32, HIP_R_32F, HIPBLAS_COMPUTE_32F));
+        const auto fp32Name = kernelNameOf(fp32);
+        ASSERT_FALSE(fp32Name.empty());
+        writeTuningFile(m_path, m_stamp, {{fp32, fp32Name}});
+        useCache(m_path);
+
+        for(int call = 0; call < 2; call++)
+        {
+            SCOPED_TRACE(call);
+            int launched = -1;
+            ASSERT_TRUE(launchGemm(AlgoFrom::Null, -1, &launched, true));
+            EXPECT_EQ(launched, m_identities[0].index);
+        }
+
+        const auto c = counters();
+        EXPECT_EQ(c.hits, 0u);
+        EXPECT_EQ(c.misses, 2u);
+        EXPECT_EQ(c.invalidated, 0u);
+    }
+
+    // Replay keeps which entries still name their kernels per shape, so an
+    // entry loaded after a shape has fallen back must still be found.
+    TEST_F(TuningCache_pre_checkin, NullAlgoReplaysAnEntryLoadedAfterItsShapeFellBack)
+    {
+        if(!haveSolutions(2))
+            GTEST_SKIP() << "the heuristic offers one solution for this problem";
+
+        useCache(m_path);
+
+        int launched = -1;
+        ASSERT_TRUE(launchGemm(AlgoFrom::Null, -1, &launched));
+        EXPECT_EQ(launched, m_identities[0].index);
+
+        // The heuristic looks for the file on every query, so this one loads it.
+        const auto& recorded = m_identities[1];
+        writeTuningFile(m_path, m_stamp, {{recorded.index, recorded.kernelName}});
+        int selected = -1;
+        ASSERT_TRUE(runGemm(&selected));
+        ASSERT_EQ(selected, recorded.index);
+
+        ASSERT_TRUE(launchGemm(AlgoFrom::Null, -1, &launched, true));
+        EXPECT_EQ(launched, recorded.index);
+    }
+
+    // Replay looks for a missing file at most once a second rather than on
+    // every call, but it does look again.
+    TEST_F(TuningCache_pre_checkin, NullAlgoFindsAFileCreatedAfterItsFirstLook)
+    {
+        if(!haveSolutions(2))
+            GTEST_SKIP() << "the heuristic offers one solution for this problem";
+
+        useCache(m_path);
+
+        int launched = -1;
+        ASSERT_TRUE(launchGemm(AlgoFrom::Null, -1, &launched));
+        EXPECT_EQ(launched, m_identities[0].index);
+
+        const auto& recorded = m_identities[1];
+        writeTuningFile(m_path, m_stamp, {{recorded.index, recorded.kernelName}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+        ASSERT_TRUE(launchGemm(AlgoFrom::Null, -1, &launched));
+        EXPECT_EQ(launched, recorded.index);
+        EXPECT_EQ(counters().loaded, 1u);
     }
 
     // A cache that served nothing must not read like a process that asked

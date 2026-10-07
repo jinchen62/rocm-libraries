@@ -3698,10 +3698,41 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         if(prob.trans_b == HIPBLAS_OP_C)
             data->problem.setBOps({TensileLite::TensorOp::ComplexConjugate()});
 
-        // Noted before algo is filled in below. An explicit algo launches as
-        // given, whatever the cache holds; the cache chooses the kernel only
-        // when the caller leaves that choice to the library.
-        const bool callerSuppliedAlgo = (algo != nullptr);
+        if(algo == nullptr)
+        {
+            // Cache replay for a call that passed no algo. hipblasLtMatmul
+            // accepts algo == nullptr and then runs getBestSolutions below
+            // without ever entering hipblasLtMatmulAlgoGetHeuristic, so without
+            // this such a call would never be served from the cache. An
+            // explicit algo launches as given, whatever the cache holds.
+            try
+            {
+                const auto& tuning = TensileLite::TuningModeSingleton::getInstance();
+
+                if(tuning.reads() && !prob.grouped_gemm
+                   && prob.batchMode != HIPBLASLT_BATCH_MODE_POINTER_ARRAY)
+                {
+                    // A matmul-only caller never reaches the heuristic entry
+                    // point, which is the only other place that loads the file.
+                    TensileLite::loadTuningFileForReplay(tuning.cachePath());
+
+                    if(tuning_cache_replay(handle,
+                                           RocblasltContractionProblem2ProblemOverride(prob),
+                                           prob,
+                                           gemmData,
+                                           &heuristicResult.algo)
+                       >= 0)
+                        algo = &heuristicResult.algo;
+                }
+            }
+            catch(...)
+            {
+                // The cache is an optimisation: a lookup that throws leaves the
+                // call on default selection rather than failing it.
+                static_cast<void>(hipGetLastError());
+                algo = nullptr;
+            }
+        }
 
         if(algo == nullptr)
         {
@@ -3722,52 +3753,6 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         int32_t             coldIterations     = ClientArguments.GetColdIterationsValue();
 
         int* solutionIndex = (int*)algo->data;
-
-        // Cache replay for a call that passed no algo. hipblasLtMatmul accepts
-        // algo == nullptr and then runs getBestSolutions above without ever
-        // entering hipblasLtMatmulAlgoGetHeuristic, so without this such a call
-        // would never be served from the cache. Only the index used for this
-        // launch changes; the caller's algo is const.
-        int launchIndex = -1;
-        try
-        {
-            const auto& tuning = TensileLite::TuningModeSingleton::getInstance();
-
-            if(tuning.reads() && !callerSuppliedAlgo && !prob.grouped_gemm
-               && prob.batchMode != HIPBLASLT_BATCH_MODE_POINTER_ARRAY)
-            {
-                // A matmul-only caller never reaches the heuristic entry point,
-                // which is the only other place that loads the file.
-                TensileLite::getContractionProblemsFromFile(tuning.cachePath());
-
-                const TensileLite::ProblemOverride key
-                    = RocblasltContractionProblem2ProblemOverride(prob);
-                const int cachedIndex = tuning_cache_find_valid_entry(
-                    handle, key, prob, gemmData, prob.workspaceSize);
-
-                TensileLite::recordTuningLookup(key, cachedIndex >= 0);
-                auto& counters = TensileLite::TuningCounters::instance();
-                if(cachedIndex >= 0)
-                {
-                    counters.hits++;
-                    launchIndex = cachedIndex;
-                }
-                else
-                {
-                    counters.misses++;
-                }
-            }
-        }
-        catch(...)
-        {
-            // The cache is an optimisation: a lookup that throws leaves the call
-            // on default selection rather than failing it.
-            static_cast<void>(hipGetLastError());
-            launchIndex = -1;
-        }
-
-        if(launchIndex >= 0)
-            solutionIndex = &launchIndex;
 
         data->algoIndex    = *solutionIndex;
         data->inputs       = GetTensileInputs(prob);
@@ -3812,10 +3797,8 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
 
         if(get_logger_layer_mode() & rocblaslt_layer_mode_log_extended_profile)
         {
-            auto loggedAlgo           = *algo;
-            *(int*)loggedAlgo.data    = *solutionIndex;
-            std::string kernel_name   = getKernelNameFromAlgoIndex(handle, loggedAlgo);
-            std::string Solution_name = getSolutionNameFromAlgoIndex(handle, loggedAlgo);
+            std::string kernel_name   = getKernelNameFromAlgoIndex(handle, *algo);
+            std::string Solution_name = getSolutionNameFromAlgoIndex(handle, *algo);
 
             logExtendedProfileFromTensileDataGemm(data->problem,
                                                   data->inputs,
@@ -5570,6 +5553,44 @@ rocblaslt_status isSolutionSupportedNoMutation(rocblaslt_handle                 
     catch(...)
     {
         data->problem = std::move(savedProblem);
+        throw;
+    }
+}
+
+rocblaslt_status isSolutionSupportedInPlace(rocblaslt_handle                   handle,
+                                            const RocblasltContractionProblem& prob,
+                                            std::shared_ptr<void>              gemmData,
+                                            rocblaslt_matmul_algo*             algo,
+                                            size_t*                            workspaceSizeInBytes)
+{
+#ifdef HIPBLASLT_USE_ROCROLLER
+    if(useRocRoller(handle, prob))
+        return isSolutionSupportedNoMutation(handle, prob, gemmData, algo, workspaceSizeInBytes);
+#endif
+
+    std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
+    updateTensileProblem(prob, data->problem);
+
+    // All that the check below sets on the problem.
+    const auto params    = data->problem.getParams();
+    const auto workspace = data->problem.workspaceSize();
+    auto       restore   = [&] {
+        data->problem.setParams() = params;
+        data->problem.setWorkspaceSize(workspace);
+    };
+
+    RocblasltContractionProblem inputs = prob;
+    rocblaslt::RocTuningV2*     tuning = nullptr;
+    try
+    {
+        const rocblaslt_status status = isSolutionSupported(
+            handle, data->problem, inputs, algo, tuning, workspaceSizeInBytes);
+        restore();
+        return status;
+    }
+    catch(...)
+    {
+        restore();
         throw;
     }
 }

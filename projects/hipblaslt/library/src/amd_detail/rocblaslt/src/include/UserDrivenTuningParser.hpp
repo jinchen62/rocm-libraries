@@ -183,6 +183,18 @@ namespace TensileLite
      */
     void getContractionProblemsFromFile(const std::string& path);
 
+    /**
+     * getContractionProblemsFromFile for cache replay, which runs on every
+     * matmul that passes no algo. A file that is not there is looked for again
+     * at most once a second rather than on every call, since each look is a
+     * failed open and a stat. The heuristic entry point still looks on every
+     * query.
+     */
+    void loadTuningFileForReplay(const std::string& path);
+
+    /** Let the next loadTuningFileForReplay look at once. Tests only. */
+    void resetReplayLoadForTest();
+
     /** How the cache file was read, for the startup line. */
     enum class TuningLoadStatus : uint32_t
     {

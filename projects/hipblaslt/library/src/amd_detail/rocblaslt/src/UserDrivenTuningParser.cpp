@@ -29,6 +29,7 @@
 #include "rocblaslt_secure_env.hpp"
 #include "utility.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -372,5 +373,35 @@ namespace TensileLite
 
         if(managed)
             announceTuningModeOnce(status);
+    }
+
+    namespace
+    {
+        using ReplayClock = std::chrono::steady_clock;
+
+        // When replay may next look for a file that was not there.
+        std::atomic<ReplayClock::rep> nextReplayLoad{0};
+    }
+
+    void loadTuningFileForReplay(const std::string& path)
+    {
+        if(path.empty() || OverrideMap::getMap().isLoaded(path))
+            return;
+
+        const auto now = ReplayClock::now().time_since_epoch().count();
+        if(now < nextReplayLoad.load(std::memory_order_relaxed))
+            return;
+        nextReplayLoad.store(
+            now
+                + std::chrono::duration_cast<ReplayClock::duration>(std::chrono::seconds(1))
+                      .count(),
+            std::memory_order_relaxed);
+
+        getContractionProblemsFromFile(path);
+    }
+
+    void resetReplayLoadForTest()
+    {
+        nextReplayLoad.store(0, std::memory_order_relaxed);
     }
 } // namespace TensileLite

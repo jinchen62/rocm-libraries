@@ -192,6 +192,19 @@ rocblaslt_status isSolutionSupportedNoMutation(rocblaslt_handle                 
                                                rocblaslt_matmul_algo*             algo,
                                                size_t* workspaceSizeInBytes);
 
+/**
+ * isSolutionSupported, leaving gemmData's Tensile problem as
+ * updateTensileProblem(prob) makes it rather than as the check leaves it. It
+ * copies no problem, as isSolutionSupportedNoMutation does at an allocation per
+ * tensor, so it suits a caller that goes on to launch prob, as cache replay
+ * does.
+ */
+rocblaslt_status isSolutionSupportedInPlace(rocblaslt_handle                   handle,
+                                            const RocblasltContractionProblem& prob,
+                                            std::shared_ptr<void>              gemmData,
+                                            rocblaslt_matmul_algo*             algo,
+                                            size_t* workspaceSizeInBytes);
+
 template <typename Tuning>
 rocblaslt_status isSolutionSupported(rocblaslt_handle              handle,
                                      const rocblaslt::RocGemmType& gemmType,
@@ -237,17 +250,20 @@ TensileLite::ProblemOverride
 TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<void>);
 
 /**
- * The solution index of the first entry for this key that still resolves to its
- * recorded kernel and supports this problem, or -1 when there is none.
+ * Cache replay for a matmul that passed no algo: the solution index of the first
+ * entry for this key that still resolves to its recorded kernel and supports
+ * this problem within its workspace, or -1 when there is none. Fills *algo to
+ * launch that entry, and counts the lookup.
  *
- * A pure probe: the caller counts the lookup, because only it knows whether the
- * probe decided which kernel the call launches.
+ * Which entries still resolve to their recorded kernels is worked out once per
+ * key and kept until the loaded entries change; support depends on the call and
+ * is checked every time.
  */
-int tuning_cache_find_valid_entry(rocblaslt_handle                    handle,
-                                  const TensileLite::ProblemOverride& key,
-                                  const RocblasltContractionProblem&  problem,
-                                  std::shared_ptr<void>               gemmData,
-                                  size_t                              max_workspace_bytes);
+int tuning_cache_replay(rocblaslt_handle                    handle,
+                        const TensileLite::ProblemOverride& key,
+                        const RocblasltContractionProblem&  problem,
+                        std::shared_ptr<void>               gemmData,
+                        rocblaslt_matmul_algo*              algo);
 
 /**
  * The solution index this thread last launched through runContractionProblem,
