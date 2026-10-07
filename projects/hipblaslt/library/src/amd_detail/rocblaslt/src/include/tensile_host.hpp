@@ -294,6 +294,26 @@ int tuningLastLaunchedIndexForTest();
  */
 void tuningInjectFailureForTest(int stage);
 
+/** The span tuning gives a tensor it copies or writes, as its scratch plan sizes it. */
+size_t tuningTensorSpanForTest(size_t elementSize,
+                               size_t rows,
+                               size_t cols,
+                               size_t colStride,
+                               size_t batchCount,
+                               size_t batchStride,
+                               bool*  expanded);
+
+/**
+ * The scratch tuning would lay out for prob, given the rotating budget and cap,
+ * as values in the order hipblaslt_tuning_scratch_plan_for_test documents.
+ * Returns how many there are.
+ */
+size_t tuningScratchPlanForTest(const RocblasltContractionProblem& prob,
+                                size_t                             rotatingBytes,
+                                size_t                             cap,
+                                uint64_t*                          values,
+                                size_t                             count);
+
 TensileLite::ContractionProblemGemm* ExtractProblemGemm(std::shared_ptr<void>);
 
 // Push the GemmPreference-supplied StreamK tile scheduling mode onto every

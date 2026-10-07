@@ -26,6 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -45,6 +46,28 @@ extern "C" void   hipblaslt_tuning_reset_for_test();
 extern "C" int    hipblaslt_tuning_last_launch_for_test();
 extern "C" void   hipblaslt_tuning_inject_failure_for_test(int stage);
 extern "C" size_t hipblaslt_tuning_stats_for_test(uint64_t* values, size_t count);
+extern "C" size_t hipblaslt_tuning_tensor_span_for_test(size_t elementSize,
+                                                        size_t rows,
+                                                        size_t cols,
+                                                        size_t colStride,
+                                                        size_t batchCount,
+                                                        size_t batchStride,
+                                                        int*   expanded);
+extern "C" size_t hipblaslt_tuning_scratch_plan_for_test(void*       handle,
+                                                         void*       matmulDesc,
+                                                         void*       matA,
+                                                         void*       matB,
+                                                         void*       matC,
+                                                         void*       matD,
+                                                         const void* A,
+                                                         const void* B,
+                                                         const void* C,
+                                                         void*       D,
+                                                         size_t      workspaceBytes,
+                                                         size_t      rotatingBytes,
+                                                         size_t      capBytes,
+                                                         uint64_t*   values,
+                                                         size_t      count);
 
 #ifdef WIN32
 static int setenv(const char* name, const char* value, int overwrite)
@@ -1695,5 +1718,364 @@ namespace
         enterMode("cache", m_path);
         EXPECT_TRUE(extensionHeuristicHits(1024, 512, 1024, -1, true))
             << "the scaling type was keyed although nothing is scaled";
+    }
+
+    // The scratch plan decides what memory a candidate can touch. An output
+    // span that is too small lets a kernel write past its block, and an input
+    // span that is only an upper bound must never become the length of a copy
+    // from the caller's buffer. These cases check the plan's numbers directly,
+    // which a measurement cannot show.
+
+    struct Span
+    {
+        size_t bytes    = 0;
+        bool   expanded = false;
+    };
+
+    Span tensorSpan(size_t elementSize,
+                    size_t rows,
+                    size_t cols,
+                    size_t colStride,
+                    size_t batchCount  = 1,
+                    size_t batchStride = 0)
+    {
+        int          expanded = -1;
+        const size_t bytes    = hipblaslt_tuning_tensor_span_for_test(
+            elementSize, rows, cols, colStride, batchCount, batchStride, &expanded);
+        EXPECT_NE(expanded, -1) << "the span did not report whether it rounded a stride up";
+        return {bytes, expanded == 1};
+    }
+
+    TEST(TuningScratchSpan_pre_checkin, SpanFollowsTheStridesGiven)
+    {
+        // The last column ends rows past the start of the last column, and the
+        // last batch likewise after the start of the last batch.
+        EXPECT_EQ(tensorSpan(2, 8, 4, 8).bytes, 64u);
+        EXPECT_EQ(tensorSpan(2, 8, 4, 10).bytes, (10u * 3 + 8) * 2);
+        EXPECT_EQ(tensorSpan(2, 8, 4, 8, 3, 40).bytes, (40u * 2 + 32) * 2);
+        EXPECT_FALSE(tensorSpan(2, 8, 4, 10, 3, 40).expanded);
+    }
+
+    // A stride too small to keep columns or batches apart is rounded up to
+    // dense and flagged: as a span to write into that is safe, but the caller's
+    // buffer is smaller than it.
+    TEST(TuningScratchSpan_pre_checkin, OverlappingStridesAreRoundedUpAndFlagged)
+    {
+        const auto narrowColumns = tensorSpan(2, 8, 4, 5);
+        EXPECT_EQ(narrowColumns.bytes, 64u);
+        EXPECT_TRUE(narrowColumns.expanded);
+
+        const auto broadcast = tensorSpan(2, 8, 4, 8, 3, 0);
+        EXPECT_EQ(broadcast.bytes, 3u * 32 * 2);
+        EXPECT_TRUE(broadcast.expanded);
+
+        const auto overlapping = tensorSpan(2, 8, 4, 8, 3, 16);
+        EXPECT_EQ(overlapping.bytes, 3u * 32 * 2);
+        EXPECT_TRUE(overlapping.expanded);
+
+        EXPECT_FALSE(tensorSpan(2, 8, 4, 8, 1, 0).expanded)
+            << "a batch stride was rounded up for a single batch, which never uses it";
+    }
+
+    // A span too large for size_t is 0, never a wrapped value small enough to
+    // pass for a real one.
+    TEST(TuningScratchSpan_pre_checkin, SpanThatOverflowsIsZero)
+    {
+        const size_t most = std::numeric_limits<size_t>::max();
+        EXPECT_EQ(tensorSpan(1, 2, 3, most / 2).bytes, 0u) << "columns";
+        EXPECT_EQ(tensorSpan(1, 4, 1, 4, 3, most / 2).bytes, 0u) << "batches";
+        EXPECT_EQ(tensorSpan(8, most / 4, 1, most / 4).bytes, 0u) << "bytes";
+        EXPECT_EQ(tensorSpan(2, 0, 4, 8).bytes, 0u) << "an empty tensor";
+    }
+
+    /** A matmul for the scratch plan, fp16 throughout, as a caller describes it. */
+    struct PlanCase
+    {
+        int64_t            m = 64, n = 32, k = 128;
+        hipblasOperation_t opA = HIPBLAS_OP_N, opB = HIPBLAS_OP_N;
+
+        // Leading dimensions, where 0 is dense, and batch strides, where -1 is
+        // dense.
+        int64_t lda = 0, ldb = 0, ldc = 0, ldd = 0;
+        int32_t batch   = 1;
+        int64_t strideA = -1, strideB = -1, strideC = -1, strideD = -1;
+
+        bool                inPlace    = false;
+        hipblasLtEpilogue_t epilogue   = HIPBLASLT_EPILOGUE_DEFAULT;
+        int32_t             biasStride = 0;
+
+        size_t rotatingBytes = 0;
+        size_t cap           = std::numeric_limits<size_t>::max();
+    };
+
+    struct Plan
+    {
+        bool     usable = false;
+        uint64_t blocks = 0, total = 0;
+        uint64_t bytesA = 0, bytesB = 0, bytesC = 0, bytesD = 0, bytesInPlaceC = 0, bytesE = 0,
+                 bytesBias = 0;
+    };
+
+    bool planFor(const PlanCase& c, Plan* plan)
+    {
+        hipblasLtHandle_t handle = nullptr;
+        if(hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS)
+            return false;
+
+        hipblasLtMatrixLayout_t layouts[4] = {};
+        hipblasLtMatmulDesc_t   desc       = nullptr;
+
+        auto layout = [&](hipblasLtMatrixLayout_t* out,
+                          int64_t                  rows,
+                          int64_t                  cols,
+                          int64_t                  leading,
+                          int64_t                  stride) {
+            const int64_t ld          = leading ? leading : rows;
+            const int64_t batchStride = stride >= 0 ? stride : ld * cols;
+            return hipblasLtMatrixLayoutCreate(out, HIP_R_16F, rows, cols, ld)
+                       == HIPBLAS_STATUS_SUCCESS
+                   && hipblasLtMatrixLayoutSetAttribute(
+                          *out, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &c.batch, sizeof(c.batch))
+                          == HIPBLAS_STATUS_SUCCESS
+                   && hipblasLtMatrixLayoutSetAttribute(
+                          *out,
+                          HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                          &batchStride,
+                          sizeof(batchStride))
+                          == HIPBLAS_STATUS_SUCCESS;
+        };
+
+        // Only compared, never dereferenced, so any distinct addresses do.
+        static char    buffers[5];
+        const void*    A    = &buffers[0];
+        const void*    B    = &buffers[1];
+        const void*    C    = &buffers[2];
+        void*          D    = c.inPlace ? &buffers[2] : &buffers[3];
+        void*          bias = &buffers[4];
+        const bool     nA   = c.opA == HIPBLAS_OP_N;
+        const bool     nB   = c.opB == HIPBLAS_OP_N;
+        const int32_t  opA = c.opA, opB = c.opB;
+        const uint32_t epilogue = c.epilogue;
+        const int32_t  biasType = HIP_R_32F;
+
+        bool ok = layout(&layouts[0], nA ? c.m : c.k, nA ? c.k : c.m, c.lda, c.strideA)
+                  && layout(&layouts[1], nB ? c.k : c.n, nB ? c.n : c.k, c.ldb, c.strideB)
+                  && layout(&layouts[2], c.m, c.n, c.ldc, c.strideC)
+                  && layout(&layouts[3], c.m, c.n, c.ldd, c.strideD)
+                  && hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F)
+                         == HIPBLAS_STATUS_SUCCESS
+                  && hipblasLtMatmulDescSetAttribute(
+                         desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA))
+                         == HIPBLAS_STATUS_SUCCESS
+                  && hipblasLtMatmulDescSetAttribute(
+                         desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB))
+                         == HIPBLAS_STATUS_SUCCESS
+                  && hipblasLtMatmulDescSetAttribute(
+                         desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue))
+                         == HIPBLAS_STATUS_SUCCESS;
+        if(ok && c.epilogue != HIPBLASLT_EPILOGUE_DEFAULT)
+            ok = hipblasLtMatmulDescSetAttribute(
+                     desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias))
+                     == HIPBLAS_STATUS_SUCCESS
+                 && hipblasLtMatmulDescSetAttribute(
+                        desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &biasType, sizeof(biasType))
+                        == HIPBLAS_STATUS_SUCCESS
+                 && hipblasLtMatmulDescSetAttribute(desc,
+                                                    HIPBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
+                                                    &c.biasStride,
+                                                    sizeof(c.biasStride))
+                        == HIPBLAS_STATUS_SUCCESS;
+
+        uint64_t v[10] = {};
+        ok             = ok
+             && hipblaslt_tuning_scratch_plan_for_test(handle,
+                                                       desc,
+                                                       layouts[0],
+                                                       layouts[1],
+                                                       layouts[2],
+                                                       layouts[3],
+                                                       A,
+                                                       B,
+                                                       C,
+                                                       D,
+                                                       0,
+                                                       c.rotatingBytes,
+                                                       c.cap,
+                                                       v,
+                                                       10)
+                    >= 10;
+        if(ok)
+            *plan = {v[0] != 0, v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]};
+
+        if(desc)
+            hipblasLtMatmulDescDestroy(desc);
+        for(auto l : layouts)
+            if(l)
+                hipblasLtMatrixLayoutDestroy(l);
+        hipblasLtDestroy(handle);
+        return ok;
+    }
+
+    class TuningScratchPlan_pre_checkin : public ::testing::Test
+    {
+    protected:
+        void SetUp() override
+        {
+            // The plan needs no GPU work, but a handle needs a device.
+            if(!gpuAvailable())
+                GTEST_SKIP() << "No GPU available";
+        }
+    };
+
+    // Each tensor is sized from its own leading dimension, including C and D,
+    // which need not share one.
+    TEST_F(TuningScratchPlan_pre_checkin, EachSpanFollowsItsOwnLeadingDimension)
+    {
+        PlanCase padded;
+        padded.lda = 80;
+        padded.ldb = 136;
+        padded.ldc = 72;
+        padded.ldd = 96;
+
+        Plan plan;
+        ASSERT_TRUE(planFor(padded, &plan));
+        ASSERT_TRUE(plan.usable);
+        EXPECT_EQ(plan.bytesA, (80u * 127 + 64) * 2);
+        EXPECT_EQ(plan.bytesB, (136u * 31 + 128) * 2);
+        EXPECT_EQ(plan.bytesC, (72u * 31 + 64) * 2);
+        EXPECT_EQ(plan.bytesD, (96u * 31 + 64) * 2);
+    }
+
+    // In place, C is read through D's block, so that block covers whichever
+    // of the two reaches further.
+    TEST_F(TuningScratchPlan_pre_checkin, InPlaceBlockCoversTheWiderOfCAndD)
+    {
+        PlanCase inPlace;
+        inPlace.inPlace = true;
+        inPlace.ldc     = 96;
+
+        Plan plan;
+        ASSERT_TRUE(planFor(inPlace, &plan));
+        ASSERT_TRUE(plan.usable);
+        EXPECT_EQ(plan.bytesInPlaceC, (96u * 31 + 64) * 2);
+        EXPECT_EQ(plan.bytesD, plan.bytesInPlaceC);
+        EXPECT_EQ(plan.bytesC, 0u) << "C has a block of its own as well as D's";
+    }
+
+    // A broadcast input's span is only an upper bound on the caller's buffer,
+    // so it is never copied for rotation: the search measures with one block
+    // rather than reading past the end of a one-batch allocation.
+    TEST_F(TuningScratchPlan_pre_checkin, BroadcastInputIsNotRotated)
+    {
+        PlanCase batched;
+        batched.batch         = 2;
+        batched.rotatingBytes = size_t(64) << 20;
+
+        Plan dense;
+        ASSERT_TRUE(planFor(batched, &dense));
+        ASSERT_TRUE(dense.usable);
+        ASSERT_GT(dense.blocks, 1u) << "a dense batched problem does not rotate either";
+
+        for(const char* input : {"A", "C"})
+        {
+            SCOPED_TRACE(input);
+            PlanCase broadcast                                        = batched;
+            (input[0] == 'A' ? broadcast.strideA : broadcast.strideC) = 0;
+
+            Plan plan;
+            ASSERT_TRUE(planFor(broadcast, &plan));
+            ASSERT_TRUE(plan.usable);
+            EXPECT_EQ(plan.blocks, 1u);
+        }
+    }
+
+    // A gradient epilogue writes the bias, as long as the longer side of D,
+    // once per batch at the bias batch stride.
+    TEST_F(TuningScratchPlan_pre_checkin, GradientBiasCoversEveryBatchAtItsStride)
+    {
+        PlanCase grad;
+        grad.epilogue   = HIPBLASLT_EPILOGUE_BGRADB;
+        grad.batch      = 2;
+        grad.biasStride = 80;
+
+        Plan plan;
+        ASSERT_TRUE(planFor(grad, &plan));
+        ASSERT_TRUE(plan.usable);
+        EXPECT_EQ(plan.bytesBias, (80u + 64) * sizeof(float));
+    }
+
+    // A cap below the full rotation trims blocks rather than declining. A cap
+    // below a single block is left for the scratch allocation to refuse.
+    TEST_F(TuningScratchPlan_pre_checkin, CapTrimsTheRotation)
+    {
+        PlanCase c;
+        c.rotatingBytes = size_t(64) << 20;
+
+        Plan full;
+        ASSERT_TRUE(planFor(c, &full));
+        ASSERT_TRUE(full.usable);
+        ASSERT_GE(full.blocks, 4u);
+
+        // Every tensor rotates in step, each aligned as the layout aligns it.
+        auto           aligned  = [](uint64_t v) { return (v + 255) / 256 * 256; };
+        const uint64_t perBlock = aligned(full.bytesA) + aligned(full.bytesB) + aligned(full.bytesC)
+                                  + aligned(full.bytesD);
+
+        PlanCase threeBlocks      = c;
+        threeBlocks.rotatingBytes = 3 * perBlock;
+        Plan three;
+        ASSERT_TRUE(planFor(threeBlocks, &three));
+        ASSERT_EQ(three.blocks, 3u);
+
+        PlanCase capped = c;
+        capped.cap      = three.total;
+        Plan plan;
+        ASSERT_TRUE(planFor(capped, &plan));
+        EXPECT_TRUE(plan.usable);
+        EXPECT_EQ(plan.blocks, 3u);
+        EXPECT_LE(plan.total, capped.cap);
+
+        capped.cap = three.total - 1;
+        ASSERT_TRUE(planFor(capped, &plan));
+        EXPECT_EQ(plan.blocks, 2u);
+        EXPECT_LE(plan.total, capped.cap);
+
+        capped.cap = 1;
+        ASSERT_TRUE(planFor(capped, &plan));
+        EXPECT_TRUE(plan.usable);
+        EXPECT_EQ(plan.blocks, 1u);
+        EXPECT_GT(plan.total, capped.cap);
+    }
+
+    // However small the problem, the number of rotation blocks stays bounded:
+    // each costs a solve and a copy per candidate.
+    TEST_F(TuningScratchPlan_pre_checkin, RotationIsBoundedForTinyProblems)
+    {
+        PlanCase tiny;
+        tiny.m = tiny.n = tiny.k = 16;
+        tiny.rotatingBytes       = size_t(1) << 30;
+
+        Plan plan;
+        ASSERT_TRUE(planFor(tiny, &plan));
+        ASSERT_TRUE(plan.usable);
+        EXPECT_EQ(plan.blocks, 128u);
+    }
+
+    // A layout whose span does not fit in size_t is declined rather than
+    // sized from a wrapped value.
+    TEST_F(TuningScratchPlan_pre_checkin, ShapeWhoseSpanOverflowsIsDeclined)
+    {
+        PlanCase large;
+        large.batch   = 4;
+        large.strideD = int64_t(1) << 40;
+        Plan plan;
+        ASSERT_TRUE(planFor(large, &plan));
+        ASSERT_TRUE(plan.usable) << "a large but representable stride is declined too";
+
+        PlanCase overflowing = large;
+        overflowing.strideD  = int64_t(1) << 62;
+        ASSERT_TRUE(planFor(overflowing, &plan));
+        EXPECT_FALSE(plan.usable);
+        EXPECT_EQ(plan.bytesD, 0u);
     }
 } // namespace

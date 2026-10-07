@@ -4151,8 +4151,13 @@ namespace
      * bias buffer when it is a gradient, and amaxD; a solution can write its own
      * workspace; and Stream-K writes the Synchronizer, which is shared across
      * every matmul on the handle.
+     *
+     * rotatingBytes is the budget the rotation copies aim to fill and cap the
+     * most scratch the layout may take, normally TuningPolicy::rotatingBytes()
+     * and TuningScratch's cap.
      */
-    ScratchLayout planScratch(const RocblasltContractionProblem& prob)
+    ScratchLayout
+        planScratch(const RocblasltContractionProblem& prob, size_t rotatingBytes, size_t cap)
     {
         ScratchLayout layout;
 
@@ -4315,7 +4320,7 @@ namespace
         size_t blocks = 1;
         if(rotatable && perBlock != 0 && perBlock != SIZE_MAX)
         {
-            blocks = std::max<size_t>(1, TuningPolicy::rotatingBytes() / perBlock);
+            blocks = std::max<size_t>(1, rotatingBytes / perBlock);
 
             // Each block costs a solve() and a seeding copy per candidate, so
             // the count has to stay bounded independently of how small the
@@ -4364,8 +4369,7 @@ namespace
 
         // Trim rather than decline when the full rotation exceeds the cap:
         // fewer blocks still beats measuring everything cache-hot.
-        const size_t cap   = TuningScratch::instance().cap();
-        size_t       total = place(blocks);
+        size_t total = place(blocks);
         while(blocks > 1 && total > cap)
         {
             // At least one block goes each pass, so this terminates.
@@ -4498,7 +4502,8 @@ namespace
             }
         }
 
-        const ScratchLayout layout = planScratch(prob);
+        const ScratchLayout layout
+            = planScratch(prob, TuningPolicy::rotatingBytes(), TuningScratch::instance().cap());
         if(!layout.usable)
         {
             TensileLite::TuningCounters::instance().skipped++;
@@ -4998,6 +5003,39 @@ namespace
         return TuningAttempt::Tuned;
     }
 } // namespace
+
+size_t tuningTensorSpanForTest(size_t elementSize,
+                               size_t rows,
+                               size_t cols,
+                               size_t colStride,
+                               size_t batchCount,
+                               size_t batchStride,
+                               bool*  expanded)
+{
+    return tensorSpanBytes(elementSize, rows, cols, colStride, batchCount, batchStride, expanded);
+}
+
+size_t tuningScratchPlanForTest(const RocblasltContractionProblem& prob,
+                                size_t                             rotatingBytes,
+                                size_t                             cap,
+                                uint64_t*                          values,
+                                size_t                             count)
+{
+    const ScratchLayout layout  = planScratch(prob, rotatingBytes, cap);
+    const uint64_t      known[] = {layout.usable,
+                                   layout.blockCount,
+                                   layout.total,
+                                   layout.bytesA,
+                                   layout.bytesB,
+                                   layout.bytesC,
+                                   layout.bytesD,
+                                   layout.bytesInPlaceC,
+                                   layout.bytesE,
+                                   layout.bytesBias};
+    for(size_t i = 0; i < count && i < std::size(known); i++)
+        values[i] = known[i];
+    return std::size(known);
+}
 
 static bool readsStreamKFlags(const TensileLite::ContractionSolution& solution)
 {

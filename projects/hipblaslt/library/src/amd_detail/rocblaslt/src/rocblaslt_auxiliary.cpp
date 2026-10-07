@@ -3239,6 +3239,67 @@ extern "C" HIPBLASLT_EXPORT void hipblaslt_tuning_inject_failure_for_test(int st
     tuningInjectFailureForTest(stage);
 }
 
+// The span tuning gives a tensor it copies or writes, and in *expanded whether
+// a stride had to be rounded up to keep it an upper bound. 0 means the span
+// cannot be established.
+extern "C" HIPBLASLT_EXPORT size_t hipblaslt_tuning_tensor_span_for_test(size_t elementSize,
+                                                                         size_t rows,
+                                                                         size_t cols,
+                                                                         size_t colStride,
+                                                                         size_t batchCount,
+                                                                         size_t batchStride,
+                                                                         int*   expanded)
+{
+    bool         rounded = false;
+    const size_t span    = tuningTensorSpanForTest(
+        elementSize, rows, cols, colStride, batchCount, batchStride, &rounded);
+    if(expanded)
+        *expanded = rounded;
+    return span;
+}
+
+// The scratch tuning would lay out to measure this matmul, with the rotating
+// budget and the cap given rather than read from the environment. The
+// descriptors are the public ones; the pointers are only compared, never
+// dereferenced. Writes up to count values, in this order:
+//   0 usable, 1 rotation blocks, 2 total bytes
+//   3 A, 4 B, 5 C, 6 D, 7 in-place C, 8 E, 9 bias
+//       Each tensor's span in bytes, 0 when the layout has none.
+// Returns how many values there are.
+extern "C" HIPBLASLT_EXPORT size_t hipblaslt_tuning_scratch_plan_for_test(void*       handle,
+                                                                          void*       matmulDesc,
+                                                                          void*       matA,
+                                                                          void*       matB,
+                                                                          void*       matC,
+                                                                          void*       matD,
+                                                                          const void* A,
+                                                                          const void* B,
+                                                                          const void* C,
+                                                                          void*       D,
+                                                                          size_t    workspaceBytes,
+                                                                          size_t    rotatingBytes,
+                                                                          size_t    capBytes,
+                                                                          uint64_t* values,
+                                                                          size_t    count)
+{
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    auto        prob  = construct_rocblaslt_problem(static_cast<rocblaslt_handle>(handle),
+                                            static_cast<rocblaslt_matmul_desc>(matmulDesc),
+                                            static_cast<rocblaslt_matrix_layout>(matA),
+                                            static_cast<rocblaslt_matrix_layout>(matB),
+                                            static_cast<rocblaslt_matrix_layout>(matC),
+                                            static_cast<rocblaslt_matrix_layout>(matD),
+                                            &alpha,
+                                            &beta,
+                                            workspaceBytes);
+    prob.A            = A;
+    prob.B            = B;
+    prob.C            = C;
+    prob.D            = D;
+    return tuningScratchPlanForTest(prob, rotatingBytes, capBytes, values, count);
+}
+
 // The solution the calling thread's last hipblasLtMatmul launched, or -1,
 // cleared by reading. The counters say that a lookup matched; only this says
 // which kernel ran.
