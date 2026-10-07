@@ -5346,12 +5346,18 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
                 const TensileLite::ProblemOverride& key   = *tuningKey;
                 TensileLite::OverrideMap&           cache = TensileLite::OverrideMap::getMap();
 
+                // A shape this process has settled is neither searched nor
+                // asked about again.
+                const bool settled = TensileLite::tuningAlreadyAttempted(key);
+
                 // "No usable entry", not "no entry": rows that failed name
                 // validation after a rebuild stay in the map, and must not keep
                 // their shape from being tuned again. Replay has already looked
-                // for a call that passed no algo, and launches what it found.
+                // for a call that passed no algo, and launches what it found; a
+                // call with its own algo needs the answer only to decide whether
+                // to tune.
                 const int cachedIndex = replayed ? *solutionIndex
-                                        : callerSuppliedAlgo
+                                        : callerSuppliedAlgo && !settled
                                             ? tuning_cache_find_valid_entry(
                                                   handle, key, prob, gemmData, prob.workspaceSize)
                                             : -1;
@@ -5376,20 +5382,36 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
                 // for an entry the budget cut short when this run can get
                 // further, and for a finished entry whose recorded search covered
                 // less than this run would, such as a ranked prefix when this run
-                // searches every kernel. Rounded to milliseconds the way the
-                // benchmarker records it, so the two compare on equal terms.
-                const int64_t currentBudgetMs
-                    = static_cast<int64_t>(TuningPolicy::perShapeBudgetUs() / 1000.0);
-                const TensileLite::TuningSearch search = TuningPolicy::search(prob.workspaceSize);
-
+                // searches every kernel. The ceiling is rounded to milliseconds
+                // the way the benchmarker records it, so the two compare on equal
+                // terms.
                 auto needsRetune = [&] {
-                    return cache.needsRetune(key, search, currentBudgetMs, [&](const auto& entry) {
-                        return tuning_cache_entry_is_usable(
-                            handle, key, entry, prob, gemmData, prob.workspaceSize);
-                    });
+                    const int64_t currentBudgetMs
+                        = static_cast<int64_t>(TuningPolicy::perShapeBudgetUs() / 1000.0);
+                    return cache.needsRetune(
+                        key,
+                        TuningPolicy::search(prob.workspaceSize),
+                        currentBudgetMs,
+                        [&](const auto& entry) {
+                            return tuning_cache_entry_is_usable(
+                                handle, key, entry, prob, gemmData, prob.workspaceSize);
+                        });
                 };
 
-                if(!TensileLite::tuningAlreadyAttempted(key) && (cachedIndex < 0 || needsRetune()))
+                bool searches = false;
+                if(!settled)
+                {
+                    searches = cachedIndex < 0 || needsRetune();
+
+                    // Settled at the shape's first matmul when its search is
+                    // final for this run: asking reads the settings and checks
+                    // every row, and a shape is searched at most once per
+                    // process in any case.
+                    if(!searches)
+                        TensileLite::recordTuningAttempt(key);
+                }
+
+                if(searches)
                 {
                     // Waits rather than skipping: every shape tune mode meets is
                     // tuned whatever the thread timing, and the shared scratch
@@ -5491,18 +5513,18 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
                             }
                         }
 
-                        // Latched for the outcomes that spent the search and
-                        // left the shape wanting another: repeating it would
-                        // stall the next matmul as long again for the same
-                        // result, and at the default log level silently, since
-                        // a shape's start and failure are each reported once.
-                        // A partial winner needs it too, since a retry would
-                        // measure the same prefix under the same ceiling. A
-                        // completed tune needs no latch, since its entry closes
-                        // the gate. The declines made before tuning-start cost
-                        // microseconds and are retried, so a transient condition
-                        // can clear.
-                        if(result == TensileLite::TuningAttempt::TunedPartial
+                        // Latched for every outcome that spent the search. A
+                        // shape is searched at most once per process, whatever
+                        // settings later matmuls bring, and repeating a search
+                        // that stopped or failed would stall the next matmul as
+                        // long again for the same result, at the default log
+                        // level silently, since a shape's start and failure are
+                        // each reported once. A partial winner would measure the
+                        // same prefix under the same ceiling. The declines made
+                        // before tuning-start cost microseconds and are retried,
+                        // so a transient condition can clear.
+                        if(result == TensileLite::TuningAttempt::Tuned
+                           || result == TensileLite::TuningAttempt::TunedPartial
                            || result == TensileLite::TuningAttempt::SkippedBudget
                            || result == TensileLite::TuningAttempt::FallbackSetup
                            || result == TensileLite::TuningAttempt::FallbackEnumeration
