@@ -1649,6 +1649,48 @@ namespace
                                             << partial.first << " instead of the completed search";
     }
 
+    // A search the budget stops does not unseat a usable finished one, in the
+    // process that ran it or in a later one. A later process reads the
+    // finished search back first, so this one has to keep it in use as well,
+    // or the shape would change kernels at the next start.
+    TEST_F(TuningTune_pre_checkin, PartialSearchLeavesTheFinishedWinnerInUse)
+    {
+        const auto identities = candidateIdentities(1024, 512, 1024, 8);
+        if(identities.size() < 3)
+            GTEST_SKIP() << "this device offers fewer than three solutions for the shape";
+        const auto& finished = identities[1];
+        const int   given    = identities[2].first;
+
+        // A real row first, so every key column is what the writer emits, made
+        // into a finished search for a non-default solution over fewer
+        // candidates than the runs below search.
+        enterMode("tune", m_path);
+        ASSERT_TRUE(runGemm(1024, 512, 1024));
+        ASSERT_EQ(valueRowCount(m_path), 1u) << "tune mode did not record exactly one row";
+        ASSERT_TRUE(rewriteColumn(m_path, "solution_index", std::to_string(finished.first)));
+        ASSERT_TRUE(rewriteColumn(m_path, "kernel_name", finished.second));
+        ASSERT_TRUE(rewriteColumn(m_path, "complete", "1"));
+        ASSERT_TRUE(rewriteColumn(m_path, "search_max_candidates", "1"));
+
+        // A call with its own algo widens the search. That algo is measured
+        // first and the search stops after it, so it is the partial winner.
+        enterMode("tune", m_path);
+        hipblaslt_tuning_inject_failure_for_test(4);
+        int launched = -1;
+        ASSERT_TRUE(runGemmWith(1024, 512, 1024, AlgoFrom::Index, given, &launched));
+        EXPECT_EQ(launched, given);
+        ASSERT_EQ(valueRowCount(m_path), 2u) << "the stopped search recorded nothing";
+        EXPECT_EQ(columnValues(m_path, "complete").at(1), "0");
+
+        ASSERT_TRUE(runGemmWith(1024, 512, 1024, AlgoFrom::Null, -1, &launched));
+        EXPECT_EQ(launched, finished.first)
+            << "the partial winner displaced the finished search in the process that ran it";
+
+        enterMode("cache", m_path);
+        ASSERT_TRUE(runGemmWith(1024, 512, 1024, AlgoFrom::Null, -1, &launched));
+        EXPECT_EQ(launched, finished.first) << "a later process chose differently";
+    }
+
     // A search the budget stops keeps its best candidate only once the kernel
     // the call would otherwise run has been measured, and that kernel goes
     // first. The caller here passes a non-default algo and the search stops

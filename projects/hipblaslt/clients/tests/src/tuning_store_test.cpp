@@ -847,7 +847,7 @@ namespace
         OverrideMap unrecorded;
         TunedEntry  entry = tunedEntry(7, "kernel");
         entry.search.reset();
-        unrecorded.add(key, entry);
+        unrecorded.addIfAbsent(key, entry);
         EXPECT_FALSE(unrecorded.needsRetune(key, rankedSearch(16), 0));
 
         OverrideMap legacy;
@@ -969,26 +969,59 @@ namespace
         EXPECT_FALSE(noPath.suppressedForSecurity);
     }
 
-    // A shape is only tuned when none of its entries is usable, and its winner
-    // replaces them, even one that reuses a dead row's index. Legacy rows are
-    // matched separately and stay.
-    TEST_F(TuningStore, ReplaceAllInstallsTheWinnerAlone)
+    // The tuner adds each winner beside the rows it found, as the file appends
+    // it, so the process that tuned and a later one reading the file back
+    // choose the same entry: a finished search over a partial one, and the
+    // newest finished search over an older one.
+    TEST_F(TuningStore, LiveEntriesChooseAsTheReloadedFileDoes)
+    {
+        const ProblemOverride key          = halfKey();
+        const TunedEntry      narrow       = tunedEntry(1, "narrow", true, 0, rankedSearch(2));
+        const TunedEntry      widerPartial = tunedEntry(2, "wider", false, 1000, rankedSearch(16));
+        const TunedEntry      widerDone    = tunedEntry(3, "widest", true, 0, rankedSearch(16));
+
+        const std::vector<std::pair<std::vector<TunedEntry>, std::vector<int32_t>>> cases
+            = {{{narrow, widerPartial}, {1, 2}}, {{narrow, widerPartial, widerDone}, {3, 1, 2}}};
+        for(const auto& [entries, order] : cases)
+        {
+            SCOPED_TRACE(entries.size());
+            OverrideMap              live;
+            std::vector<std::string> rows;
+            for(const auto& entry : entries)
+            {
+                live.addIfAbsent(key, entry);
+                rows.push_back(tunedRow(key, entry));
+            }
+
+            OverrideMap reopened;
+            ASSERT_EQ(loadInto(reopened, fileOf(rows)).accepted, entries.size());
+            EXPECT_EQ(indexesOf(live.find(key)), order);
+            EXPECT_EQ(indexesOf(reopened.find(key)), order);
+        }
+
+        // Read back, the partial row still records its search, so a run with
+        // the same search and ceiling does not repeat it.
+        OverrideMap reopened;
+        loadInto(reopened, fileOf({tunedRow(key, narrow), tunedRow(key, widerPartial)}));
+        EXPECT_FALSE(reopened.needsRetune(key, rankedSearch(16), 1000));
+    }
+
+    // A repeated row refreshes its entry in place, which can mark a search
+    // finished and so change which entry find returns first: the generation
+    // moves for it as it does for an addition.
+    TEST_F(TuningStore, RefreshingAnEntryMovesTheGeneration)
     {
         const ProblemOverride key = halfKey();
 
         OverrideMap map;
-        loadInto(map,
-                 fileOf({tunedRow(key, tunedEntry(7, "NotARealKernelName")),
-                         tunedRow(key, tunedEntry(9, "other")),
-                         legacyRow(key, 3, "legacy")}));
-        ASSERT_EQ(map.find(key).size(), 2u);
+        ASSERT_TRUE(map.addIfAbsent(key, tunedEntry(1, "kernel", false, 1000)));
+        const uint64_t added = map.generation();
 
-        map.replaceAll(key, tunedEntry(7, "kernel"));
-
+        EXPECT_FALSE(map.addIfAbsent(key, tunedEntry(1, "kernel", true, 0)));
+        EXPECT_NE(map.generation(), added);
         const auto found = map.find(key);
         ASSERT_EQ(found.size(), 1u);
-        EXPECT_EQ(found[0].kernelName, std::optional<std::string>("kernel"));
-        EXPECT_EQ(indexesOf(map.findLegacy(key)), std::vector<int32_t>{3});
+        EXPECT_TRUE(found[0].complete);
     }
 
     // The file starts with the build stamp once, and every appended row reads

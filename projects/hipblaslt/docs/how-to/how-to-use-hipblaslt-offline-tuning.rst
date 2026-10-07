@@ -243,8 +243,11 @@ the call would have run untuned. Recording it means a shape too large to finish 
 benefit immediately rather than none.
 
 An incomplete entry is replayed like any other. What the marking buys is that tune mode revisits the
-shape when a run comes along that can finish the search, and replaces the row, so a partial answer
-never becomes permanent. To finish such a shape, raise or clear
+shape when a run comes along that can finish the search, and the finished row then takes precedence,
+so a partial answer never becomes permanent. When a shape has both, replay prefers a finished search
+to an incomplete one and a newer row to an older one of the same kind, in the process that tuned it
+and in every later one alike. Widening a finished search under a ceiling that stops it therefore
+leaves the finished search in use until a run completes the wider one. To finish such a shape, raise or clear
 ``HIPBLASLT_TUNING_BUDGET_MS_PER_SHAPE`` and run it in tune mode again; as a rough guide a
 2048x1024x2048 FP16 shape takes about 146 seconds on MI300X, and the cost grows with the problem.
 

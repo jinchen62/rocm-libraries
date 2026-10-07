@@ -5269,6 +5269,7 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         // and only for a caller that passed no algo.
         int  launchIndex = -1;
         int  tunedIndex  = -1;
+        int  servedIndex = -1;
         bool benchmarked = false;
 
         // Set when an attempt begins, so the handler below can tell an exception
@@ -5446,10 +5447,20 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
                             winner.schemaVersion = TensileLite::kCurrentTuningSchemaVersion;
                             winner.buildStamp    = TensileLite::currentBuildStamp();
 
-                            // Replace rather than add: any rows still here failed
-                            // validation or are superseded, and addIfAbsent would
-                            // refuse the winner if it reused one of their indexes.
-                            cache.replaceAll(key, winner);
+                            // Added beside the rows already here rather than in
+                            // their place, so this process holds what a later one
+                            // reads back from the file, and find's order, finished
+                            // searches first and the newest first within each,
+                            // picks the same winner for both. A partial winner
+                            // therefore leaves a usable completed row in use.
+                            // Rows that failed validation stay too; replay and
+                            // needsRetune both pass over them.
+                            cache.addIfAbsent(key, winner);
+
+                            // What this call launches is then what replay picks.
+                            if(!callerSuppliedAlgo)
+                                servedIndex = tuning_cache_find_valid_entry(
+                                    handle, key, prob, gemmData, prob.workspaceSize);
 
                             persisted
                                 = TensileLite::appendTunedEntry(tuning.cachePath(), prob, winner);
@@ -5517,6 +5528,7 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
             // restored below.
             static_cast<void>(hipGetLastError());
             tunedIndex  = -1;
+            servedIndex = -1;
             launchIndex = -1;
 
             // Only for an attempt that was announced: an exception from the
@@ -5547,7 +5559,7 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         }
 
         if(!callerSuppliedAlgo && tunedIndex >= 0)
-            launchIndex = tunedIndex;
+            launchIndex = servedIndex >= 0 ? servedIndex : tunedIndex;
         if(launchIndex >= 0)
             solutionIndex = &launchIndex;
 

@@ -591,25 +591,6 @@ namespace TensileLite
             return any;
         }
 
-        void add(const ProblemOverride& key, const TunedEntry& entry)
-        {
-            std::lock_guard<std::shared_timed_mutex> lock(m_mutex);
-            m_override.emplace(key, entry);
-        }
-
-        /**
-         * Drop every current-schema entry for a key and install one. A shape is
-         * tuned again only when none of its entries is usable or final, and
-         * addIfAbsent would refuse a winner that reused an old row's index.
-         */
-        void replaceAll(const ProblemOverride& key, const TunedEntry& entry)
-        {
-            std::lock_guard<std::shared_timed_mutex> lock(m_mutex);
-            m_override.erase(key);
-            m_override.emplace(key, entry);
-            m_generation.fetch_add(1, std::memory_order_release);
-        }
-
         /** addIfAbsent for a legacy row, filed under the key's legacy subset. */
         bool addLegacyIfAbsent(const ProblemOverride& key, const TunedEntry& entry)
         {
@@ -618,10 +599,11 @@ namespace TensileLite
         }
 
         /**
-         * Changes whenever an entry is added or the map is cleared, but not when
-         * a repeated row refreshes an entry's metadata. Lets a caller that
-         * derives something from a key's entries tell, without the lock, that
-         * it has to derive it again.
+         * Changes whenever an entry is added or refreshed, or the map is
+         * cleared. A refresh counts because it can mark a search finished, which
+         * changes the order find returns. Lets a caller that derives something
+         * from a key's entries tell, without the lock, that it has to derive it
+         * again.
          */
         uint64_t generation() const
         {
@@ -670,6 +652,7 @@ namespace TensileLite
                 if(it->second.sameIdentity(entry))
                 {
                     it->second = entry;
+                    m_generation.fetch_add(1, std::memory_order_release);
                     return false;
                 }
 
